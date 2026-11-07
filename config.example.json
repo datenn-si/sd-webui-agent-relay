@@ -1,0 +1,18 @@
+{
+  "forge_port": 7860,
+  "listen_port": 7861,
+  "image_dir": "images",
+  "image_ttl_hours": 168,
+  "positive": {
+    "replace": [],
+    "delete": [],
+    "prefix": [],
+    "suffix": []
+  },
+  "negative": {
+    "replace": [],
+    "delete": [],
+    "prefix": [],
+    "suffix": []
+  }
+}

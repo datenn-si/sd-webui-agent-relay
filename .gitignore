@@ -1,0 +1,9 @@
+.venv/
+.ruff_cache/
+__pycache__/
+images/
+*.pyc
+config.json
+.env
+.env.*
+config.local.json
