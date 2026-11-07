@@ -1,5 +1,6 @@
 import base64
 import contextlib
+import http.client
 import io
 import json
 import socket
@@ -10,6 +11,7 @@ import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import relay
@@ -107,16 +109,55 @@ class AddressTests(unittest.TestCase):
         )
 
 
+class ConfigTests(unittest.TestCase):
+    def test_resource_limit_defaults_and_validation(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text("{}", encoding="utf-8")
+            config = relay.load_config(path)
+            self.assertEqual(config["max_body_bytes"], 512 * 1024 * 1024)
+            self.assertEqual(config["max_connections"], 16)
+            self.assertEqual(config["max_generations"], 2)
+            path.write_text('{"max_connections": 0}', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "max_connections"):
+                relay.load_config(path)
+
+
 class FakeForge(BaseHTTPRequestHandler):
     last = {}
+    slow_release = threading.Event()
 
     def log_message(self, format, *args):
         return
 
     def do_GET(self):
-        if self.path.split("?", 1)[0] == "/sdapi/v1/samplers":
+        path = self.path.split("?", 1)[0]
+        if path == "/api/headers":
+            self._send(
+                202,
+                b"upstream",
+                "text/plain",
+                [
+                    ("X-Upstream", "preserved"),
+                    ("Connection", "X-Hop"),
+                    ("X-Hop", "removed"),
+                    ("Keep-Alive", "timeout=5"),
+                ],
+            )
+            return
+        if path == "/api/error":
+            self._send(
+                418,
+                b'{"error":"forge rejected"}',
+                "application/json",
+                [("X-Upstream", "error")],
+            )
+            return
+        if path == "/api/slow":
+            FakeForge.slow_release.wait(2)
+        if path == "/sdapi/v1/samplers":
             body = b'[{"name":"Euler"}]'
-        elif self.path.split("?", 1)[0] == "/sdapi/v1/progress":
+        elif path == "/sdapi/v1/progress":
             body = json.dumps(
                 {
                     "progress": 0.5,
@@ -155,12 +196,17 @@ class FakeForge(BaseHTTPRequestHandler):
         ).encode()
         self._send(200, body)
 
-    def _send(self, status, body):
+    def _send(self, status, body, content_type="application/json", headers=()):
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        for key, value in headers:
+            self.send_header(key, value)
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except OSError:
+            pass
 
 
 class RelayHttpTests(unittest.TestCase):
@@ -187,7 +233,12 @@ class RelayHttpTests(unittest.TestCase):
         relay.RelayHandler.base_url = f"http://{TEST_MAGICDNS}:7861"
         relay.RelayHandler.config_path = self.config
         relay.RelayHandler.ttl_seconds = 0
-        self.relay = ThreadingHTTPServer(("127.0.0.1", 0), relay.RelayHandler)
+        relay.RelayHandler.max_body_bytes = relay.DEFAULT_MAX_BODY_BYTES
+        relay.RelayHandler.generation_slots = threading.BoundedSemaphore(
+            relay.DEFAULT_MAX_GENERATIONS
+        )
+        relay.RelayHandler.upstream_timeout = relay.UPSTREAM_TIMEOUT
+        self.relay = relay.RelayServer4(("127.0.0.1", 0), relay.RelayHandler, max_connections=8)
         self.relay_thread = threading.Thread(target=self.relay.serve_forever, daemon=True)
         self.relay_thread.start()
         self.relay_port = self.relay.server_address[1]
@@ -265,6 +316,160 @@ class RelayHttpTests(unittest.TestCase):
             f"http://127.0.0.1:{self.relay_port}/sdapi/v1/samplers", timeout=5
         ) as response:
             self.assertEqual(response.read(), b'[{"name":"Euler"}]')
+
+    def test_only_api_favicon_and_images_are_routed(self):
+        for path in ("/", "/assets/index.js", "/file=sample.png"):
+            with self.subTest(path=path), self.assertRaises(HTTPError) as caught:
+                urlopen(f"http://127.0.0.1:{self.relay_port}{path}", timeout=5)
+            self.assertEqual(caught.exception.code, 404)
+        with self.assertRaises(HTTPError) as caught:
+            self._post("/", {"prompt": "must not reach Forge"})
+        self.assertEqual(caught.exception.code, 404)
+        with urlopen(f"http://127.0.0.1:{self.relay_port}/favicon.ico", timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.read(), b"{}")
+
+    def test_upstream_response_headers_and_errors(self):
+        with urlopen(f"http://127.0.0.1:{self.relay_port}/api/headers", timeout=5) as response:
+            self.assertEqual(response.status, 202)
+            self.assertEqual(response.read(), b"upstream")
+            self.assertEqual(response.headers.get("X-Upstream"), "preserved")
+            self.assertIsNone(response.headers.get("X-Hop"))
+            self.assertIsNone(response.headers.get("Keep-Alive"))
+            self.assertEqual(response.headers.get("Content-Length"), "8")
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(f"http://127.0.0.1:{self.relay_port}/api/error", timeout=5)
+        self.assertEqual(caught.exception.code, 418)
+        self.assertEqual(caught.exception.read(), b'{"error":"forge rejected"}')
+        self.assertEqual(caught.exception.headers.get("X-Upstream"), "error")
+
+    def test_upstream_connection_failure_and_timeout(self):
+        relay.RelayHandler.upstream = "http://127.0.0.1:1"
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(f"http://127.0.0.1:{self.relay_port}/sdapi/v1/samplers", timeout=5)
+        self.assertEqual(caught.exception.code, 502)
+        self.assertEqual(json.loads(caught.exception.read())["error"], "upstream unreachable")
+
+        relay.RelayHandler.upstream = f"http://127.0.0.1:{self.forge.server_address[1]}"
+        relay.RelayHandler.upstream_timeout = 0.05
+        FakeForge.slow_release.clear()
+        try:
+            with self.assertRaises(HTTPError) as caught:
+                urlopen(f"http://127.0.0.1:{self.relay_port}/api/slow", timeout=5)
+            self.assertEqual(caught.exception.code, 504)
+            self.assertEqual(json.loads(caught.exception.read())["error"], "upstream timeout")
+        finally:
+            FakeForge.slow_release.set()
+
+    def test_request_size_host_and_image_path_validation(self):
+        relay.RelayHandler.max_body_bytes = 16
+        request = Request(
+            f"http://127.0.0.1:{self.relay_port}/sdapi/v1/samplers",
+            data=b"x" * 17,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(request, timeout=5)
+        self.assertEqual(caught.exception.code, 413)
+        relay.RelayHandler.max_body_bytes = relay.DEFAULT_MAX_BODY_BYTES
+
+        with socket.create_connection(("127.0.0.1", self.relay_port), timeout=5) as sock:
+            sock.sendall(
+                (
+                    f"GET /sdapi/v1/samplers HTTP/1.1\r\n"
+                    f"Host: attacker.invalid:{self.relay_port}\r\n\r\n"
+                ).encode()
+            )
+            self.assertIn(b"400", sock.recv(512))
+
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(f"http://127.0.0.1:{self.relay_port}/images/..%2fconfig.json", timeout=5)
+        self.assertEqual(caught.exception.code, 404)
+
+    def test_generation_capacity_rejects_before_forwarding(self):
+        slots = relay.RelayHandler.generation_slots
+        acquired = [slots.acquire(blocking=False) for _ in range(relay.DEFAULT_MAX_GENERATIONS)]
+        self.assertTrue(all(acquired))
+        try:
+            with self.assertRaises(HTTPError) as caught:
+                self._post("/sdapi/v1/txt2img", {"prompt": "cat"})
+            self.assertEqual(caught.exception.code, 503)
+            self.assertEqual(
+                json.loads(caught.exception.read())["error"], "generation capacity reached"
+            )
+        finally:
+            for _ in acquired:
+                slots.release()
+
+
+class BlockingHandler(relay.RelayHandler):
+    entered = threading.Event()
+    release = threading.Event()
+
+    def do_GET(self):
+        if self.path == "/hold":
+            self.entered.set()
+            self.release.wait(5)
+        self._send(200, b"ok", "text/plain")
+
+
+class ConnectionLimitTests(unittest.TestCase):
+    def _server(self, max_connections):
+        BlockingHandler.entered.clear()
+        BlockingHandler.release.clear()
+        server = relay.RelayServer4(
+            ("127.0.0.1", 0), BlockingHandler, max_connections=max_connections
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server, thread
+
+    def _hold_connection(self, port):
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        connection.request("GET", "/hold")
+        response = connection.getresponse()
+        response.read()
+        connection.close()
+
+    def test_limit_returns_503_and_available_slot_serves_request(self):
+        server, thread = self._server(1)
+        held = threading.Thread(
+            target=self._hold_connection, args=(server.server_port,), daemon=True
+        )
+        try:
+            held.start()
+            self.assertTrue(BlockingHandler.entered.wait(2))
+            rejected = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+            rejected.request("GET", "/ok")
+            response = rejected.getresponse()
+            self.assertEqual(response.status, 503)
+            self.assertEqual(response.headers.get("Connection"), "close")
+            response.read()
+            rejected.close()
+        finally:
+            BlockingHandler.release.set()
+            server.shutdown()
+            server.server_close()
+            thread.join(2)
+
+        server, thread = self._server(2)
+        held = threading.Thread(
+            target=self._hold_connection, args=(server.server_port,), daemon=True
+        )
+        try:
+            held.start()
+            self.assertTrue(BlockingHandler.entered.wait(2))
+            available = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+            available.request("GET", "/ok")
+            response = available.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.read(), b"ok")
+            available.close()
+        finally:
+            BlockingHandler.release.set()
+            server.shutdown()
+            server.server_close()
+            thread.join(2)
 
 
 if __name__ == "__main__":

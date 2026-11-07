@@ -12,6 +12,8 @@ Forge Neo API の前段に置くリレーです。Forge Neo にはリレー実�
 
 `0.0.0.0` では待ち受けず、LAN やインターネットのインターフェースにも公開しません。`tailscale funnel` は使わないでください。
 
+リレーには Tailnet 内の端末から接続できます。同じ Tailnet に参加している端末や利用者がすべて信頼できるとは限りません。必要に応じて Tailscale ACL または grants で接続元を制限してください。Tailscale によるネットワークアクセス制御はアプリケーション独自の認証とは別のもので、このリレーには独自認証機能はありません。
+
 ## 起動
 
 ```powershell
@@ -21,6 +23,8 @@ uv run python relay.py
 起動ログの `tailscale` 行がエージェントに渡すベース URL です。画像 URL にも同じホスト名（MagicDNS の `*.ts.net`）を使います。MagicDNS が取れないときだけ Tailscale IPv4 を使います。
 
 Forge への転送先は常に `http://127.0.0.1:<forge_port>` です。`forge_port` は `config.json` で設定します。転送先をTailscaleアドレスに変更する設定はありません。
+
+既定値は、全待ち受けアドレスを合わせて同時接続16、画像生成の同時実行2、リクエストボディ512 MiBです。上限に達した接続または生成要求には503を返して接続を閉じます。ボディサイズは受信時とプロンプト書き換え後の両方で確認します。
 
 ## リレー仕様
 
@@ -54,7 +58,7 @@ Forge への転送先は常に `http://127.0.0.1:<forge_port>` です。`forge_p
 
 ### 生成以外
 
-リレーが受け付けるメソッドは `GET`、`POST`、`PUT`、`DELETE`、`OPTIONS` です。`GET /images/...` と上の2つの生成を除き、Forge のステータスとボディをそのまま返します。クエリ文字列は転送し、生成かどうかはクエリ文字列を除いたパスで判定します。拡張機能の生成ルートもこの扱いで、応答に base64 の画像が残ることがあります。
+Forge へ転送するのは `/sdapi/`、`/api/`、`/internal/` 配下のAPIパスと `GET /favicon.ico` だけです。`GET /images/<名前>` はリレー内の画像ディレクトリから配信します。WebUIのルートや静的ファイルなど、それ以外のパスはForgeへ転送せず404を返します。APIパスでは `GET`、`POST`、`PUT`、`DELETE`、`OPTIONS` を受け付けます。Forgeのステータスとボディを維持し、エンドツーエンドのレスポンスヘッダーを転送しますが、ホップバイホップヘッダー（`Connection` が指定するヘッダーを含む）は除きます。`Content-Length` は再計算し、`Cache-Control` と `X-Content-Type-Options` はリレー側で設定します。ボディを書き換えたり秘匿処理したりした場合、古くなる圧縮情報やエンティティ検証ヘッダーも除きます。クエリ文字列は転送し、生成かどうかはクエリ文字列を除いたパスで判定します。拡張機能のAPI生成ルートでも、応答に base64 の画像が残ることがあります。
 
 `current_image`、`image`、`images`、`init_images`、`mask` の中身は消しません。進行状況の `current_image` には、途中の画像が base64 で残ることがあります。書き換えたプロンプトがエージェントの送った文と違うとき、リレーはその文字列を32件まで覚え、あとの応答の文字列から除きます。画像の欄と、保存したファイルからは除きません。別の文字列にその文が含まれていれば、その部分も除きます。
 
@@ -64,16 +68,18 @@ Forge への転送先は常に `http://127.0.0.1:<forge_port>` です。`forge_p
 - JSON だがオブジェクトでない: 400 `{"error":"generation body must be a JSON object"}`
 - プロンプト欄が文字列でも文字列の配列でもない: 400 `{"error":"prompt fields must be strings"}`
 - `config.json` が読めない、またはルールとして無効: 400 `{"error":"prompt rules file is invalid"}`。詳しい理由はサーバーのログに出します。
-- `Content-Length` が整数でない: 400 `{"error":"bad content-length"}`
+- `Content-Length` が整数でない、または複数ある: 400 `{"error":"bad content-length"}`。`Transfer-Encoding` は受け付けません。
 - `Content-Length` が無い: ボディは空として扱います
-- `Content-Length` が 0 未満、または 512 MiB を超える: 413 `{"error":"body too large"}`
-- Forge へ接続できない、または生成が 6時間で終わらない: 502 `{"error":"upstream unreachable"}`
+- `Content-Length` が設定上限（既定512 MiB）を超える: 413 `{"error":"body too large"}`。書き換え後の生成ボディも確認します。
+- 不正なリクエストターゲットまたはHostヘッダー: 400 `{"error":"invalid request"}`
+- 許可されたAPI、favicon、画像以外のパス: 404 `not found`
+- Forgeへ接続できない: 502 `{"error":"upstream unreachable"}`。上流タイムアウト: 504 `{"error":"upstream timeout"}`。不正な上流HTTP応答: 502 `{"error":"invalid upstream response"}`。生成要求のタイムアウトは既定6時間です。
 - 生成の 200 応答を URL とシードにできない: 502。画像の並びを読めないときの `error` は `upstream generation response was not JSON`、`upstream images field is not a list`、`upstream image was not decodable` です。`index_of_first_image` を整数として読めないときも 502 で、変換に失敗したメッセージが `error` になります。
 - 生成のステータスが 200 以外: Forge のステータスとボディを返します
 
-応答には `Cache-Control: private, no-store` と `X-Content-Type-Options: nosniff` を付けます。
+ForgeのHTTPエラー応答は、可能な範囲でステータス、ボディ、エンドツーエンドのヘッダーを維持します。応答には `Cache-Control: private, no-store` と `X-Content-Type-Options: nosniff` を付けます。通常のHTTPリクエストは、リクエストターゲットを含めてログに出しません。
 
-この HTTP ポートに TLS の開始バイトが来たときは、接続を切り、ログに `ignored TLS handshake on the HTTP port` と出します。それ以外の HTTP でない要求は、ログに `ignored non-HTTP request` と出します。受け取ったバイト列はログに書きません。
+この HTTP ポートに TLS の開始バイトが来たときは、接続を切り、ログに `ignored TLS handshake on the HTTP port` と出します。それ以外の HTTP でない要求は、ログに `ignored non-HTTP request` と出します。受け取ったバイト列とリクエストボディはログに書きません。
 
 ## 設定ファイル
 
@@ -84,6 +90,14 @@ Copy-Item config.example.json config.json
 ```
 
 `config.example.json` は Git で管理する設定例です。`config.json` はローカル設定として `.gitignore` の対象です。実際の転送先やプロンプトルールは `config.json` に設定してください。
+
+リソース制限は `config.json` で変更できます。
+
+- `max_connections`（既定値 `16`）: loopback、Tailscale IPv4、Tailscale IPv6の全リスナーで共有する同時接続数
+- `max_generations`（既定値 `2`）: `txt2img` と `img2img` の同時実行数
+- `max_body_bytes`（既定値 `536870912`、512 MiB）: 受信ボディと書き換え後の生成ボディの最大サイズ
+
+いずれも正の整数です。変更はリレーの再起動後に反映されます。
 
 ## プロンプトルール
 
@@ -120,7 +134,7 @@ Copy-Item config.example.json config.json
 
 ## ファイアウォール
 
-リレーは実行ホストに割り当てられた Tailscale IPv4 と IPv6 にだけ bind します。既存のファイアウォールルールが Tailscale 経由の受信を許可していれば、個別ルールの追加は不要です。
+リレーは loopback と実行ホストに割り当てられた Tailscale IPv4/IPv6 に bind します。既存のファイアウォールルールが Tailscale 経由の受信を許可していれば、個別ルールの追加は不要です。接続元を制限するには、必要に応じてTailscale ACLまたはgrantsを設定してください。Tailscale経由を許可するファイアウォールルールは、アプリケーション層の認証ではありません。
 
 パブリック側のネットワークインターフェースにポートを開けないでください。`RemoteAddress` を `Any` にした許可ルールも追加しないでください。
 

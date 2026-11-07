@@ -3,6 +3,9 @@
   "listen_port": 7861,
   "image_dir": "images",
   "image_ttl_hours": 168,
+  "max_body_bytes": 536870912,
+  "max_connections": 16,
+  "max_generations": 2,
   "positive": {
     "replace": [],
     "delete": [],

@@ -12,6 +12,8 @@ The relay listens only on the following addresses:
 
 It does not listen on `0.0.0.0`, and it is not exposed on LAN or internet interfaces. Do not use `tailscale funnel`.
 
+The relay is reachable by devices on the Tailnet. Do not assume every device or user on the same Tailnet is trusted. Use Tailscale ACLs or grants to restrict which peers can connect when needed. Tailscale network access control is separate from application authentication; this relay does not implement its own authentication.
+
 ## Getting Started
 
 ```powershell
@@ -21,6 +23,8 @@ uv run python relay.py
 The `tailscale` line in the startup log is the base URL to give to the agent. Image URLs use the same hostname (the MagicDNS `*.ts.net` name). Use the Tailscale IPv4 address only if MagicDNS is unavailable.
 
 The forwarding destination to Forge is always `http://127.0.0.1:<forge_port>`. Set `forge_port` in `config.json`. There is no setting to change the forwarding destination to a Tailscale address.
+
+The default limits are 16 simultaneous connections across all listener addresses, 2 simultaneous image generations, and a 512 MiB request body. Over-capacity connections and generation requests receive 503; rejected connections are closed. The request size limit applies before and after prompt rewriting.
 
 ## Relay specification
 
@@ -54,7 +58,7 @@ A file name is 32 lowercase hex digits plus `.png`, `.jpg`, `.webp`, or `.bin`. 
 
 ### Other routes
 
-The relay accepts `GET`, `POST`, `PUT`, `DELETE`, and `OPTIONS`. Aside from `GET /images/...` and the two generation posts, it returns Forge's status and body unchanged. The query string is forwarded, and whether a request is generation is decided from the path with the query string removed. Extension generation routes take this path, and the response can still contain base64 image data.
+Only API paths under `/sdapi/`, `/api/`, and `/internal/` are forwarded to Forge. `GET /favicon.ico` is also forwarded. `GET /images/<name>` is served from the relay's image directory. Other paths, including the WebUI root and static assets, return 404 without reaching Forge. The relay accepts `GET`, `POST`, `PUT`, `DELETE`, and `OPTIONS` on the API paths. It preserves Forge's status and body, and forwards end-to-end response headers while dropping hop-by-hop headers (including headers named by `Connection`), recalculating `Content-Length`, and enforcing its own `Cache-Control` and `X-Content-Type-Options`. If the body is rewritten or redacted, stale content encoding and entity validators are also dropped. The query string is forwarded, and whether a request is generation is decided from the path with the query string removed. Extension API generation routes can still return base64 image data.
 
 The relay does not remove the contents of `current_image`, `image`, `images`, `init_images`, or `mask`. A progress response can still carry a preview in `current_image` as base64. When a rewritten prompt differs from the text the agent sent, the relay remembers up to 32 of those strings and removes them from the text of later responses. It does not remove them from image fields or from stored files. A string that contains one of them loses that part as well.
 
@@ -64,16 +68,18 @@ The relay does not remove the contents of `current_image`, `image`, `images`, `i
 - The JSON value is not an object: 400 `{"error":"generation body must be a JSON object"}`.
 - A prompt field is neither a string nor a list of strings: 400 `{"error":"prompt fields must be strings"}`.
 - `config.json` cannot be read, or the rules are invalid: 400 `{"error":"prompt rules file is invalid"}`. The server log has the detail.
-- `Content-Length` is not an integer: 400 `{"error":"bad content-length"}`.
+- `Content-Length` is not an integer, or is duplicated: 400 `{"error":"bad content-length"}`. `Transfer-Encoding` is rejected.
 - `Content-Length` is absent: the body is empty.
-- `Content-Length` is below 0, or above 512 MiB: 413 `{"error":"body too large"}`.
-- Forge cannot be reached, or a generation does not finish within 6 hours: 502 `{"error":"upstream unreachable"}`.
+- `Content-Length` exceeds the configured limit (default 512 MiB): 413 `{"error":"body too large"}`. The rewritten generation body is checked too.
+- An invalid request target or Host header: 400 `{"error":"invalid request"}`.
+- A path outside the allowed API, favicon, and image routes: 404 `not found`.
+- Forge cannot be reached: 502 `{"error":"upstream unreachable"}`. An upstream timeout: 504 `{"error":"upstream timeout"}`. An invalid upstream HTTP response: 502 `{"error":"invalid upstream response"}`. Generation requests time out after 6 hours by default.
 - A generation response of 200 cannot be turned into URLs and seeds: 502. When the image list cannot be read, `error` is `upstream generation response was not JSON`, `upstream images field is not a list`, or `upstream image was not decodable`. When `index_of_first_image` cannot be read as an integer, the 502 `error` is that conversion message.
 - Generation status is not 200: Forge's status and body are returned.
 
-Responses include `Cache-Control: private, no-store` and `X-Content-Type-Options: nosniff`.
+Forge error responses preserve their status, body, and applicable end-to-end headers. Responses include `Cache-Control: private, no-store` and `X-Content-Type-Options: nosniff`. HTTP request targets and bodies are not written to the log.
 
-A TLS client hello on this HTTP port closes the connection. The log line is `ignored TLS handshake on the HTTP port`. Any other non-HTTP request logs `ignored non-HTTP request`. The received bytes are not written to the log.
+A TLS client hello on this HTTP port closes the connection. The log line is `ignored TLS handshake on the HTTP port`. Any other non-HTTP request logs `ignored non-HTTP request`. Normal HTTP requests are logged without their request target. Received non-HTTP bytes and request bodies are not written to the log.
 
 ## Configuration File
 
@@ -84,6 +90,14 @@ Copy-Item config.example.json config.json
 ```
 
 `config.example.json` is the example configuration tracked in Git. `config.json` is your local configuration and is excluded via `.gitignore`. Set your actual forwarding destination and prompt rules in `config.json`.
+
+Resource limits can be changed in `config.json`:
+
+- `max_connections` (default `16`): simultaneous connections shared by the loopback, Tailscale IPv4, and Tailscale IPv6 listeners.
+- `max_generations` (default `2`): simultaneous `txt2img` and `img2img` requests.
+- `max_body_bytes` (default `536870912`, or 512 MiB): maximum accepted request body, including a rewritten generation body.
+
+Each value must be a positive integer. Changes take effect after restarting the relay.
 
 ## Prompt Rules
 
@@ -120,7 +134,7 @@ Served files are saved in `images/`. Files older than `image_ttl_hours` (default
 
 ## Firewall
 
-The relay binds only to the Tailscale IPv4 and IPv6 addresses assigned to the host. If your existing firewall rules already allow inbound traffic over Tailscale, no additional rule is needed.
+The relay binds to loopback and the Tailscale IPv4 and IPv6 addresses assigned to the host. If your existing firewall rules already allow inbound traffic over Tailscale, no additional rule is needed. Apply Tailscale ACLs or grants as appropriate to limit the source peers; a firewall rule allowing Tailscale traffic does not authenticate peers at the application layer.
 
 Do not open ports on public-facing network interfaces. Do not add an allow rule with `RemoteAddress` set to `Any`.
 

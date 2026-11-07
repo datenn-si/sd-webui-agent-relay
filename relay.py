@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import base64
 import binascii
+import http.client
 import json
 import re
+import shutil
 import socket
 import subprocess
 import threading
@@ -21,12 +23,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ipaddress import ip_address, ip_network
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, urlsplit
 from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.json"
 GEN_PATHS = {"/sdapi/v1/txt2img", "/sdapi/v1/img2img"}
+API_PREFIXES = ("/sdapi/", "/api/", "/internal/")
 TAILSCALE_V4 = ip_network("100.64.0.0/10")
 TAILSCALE_V6 = ip_network("fd7a:115c:a1e0::/48")
 PROMPT_FIELDS = (
@@ -49,9 +52,22 @@ DROP_REQUEST_HEADERS = {
     "content-type",
     "accept-encoding",
 }
+HOP_BY_HOP_HEADERS = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+}
+DEFAULT_MAX_BODY_BYTES = 512 * 1024 * 1024
+DEFAULT_MAX_CONNECTIONS = 16
+DEFAULT_MAX_GENERATIONS = 2
+REQUEST_TIMEOUT = 30
 # Leave image payloads alone so a base64 blob is not damaged by prompt redaction.
 IMAGE_KEYS = {"current_image", "image", "images", "init_images", "mask"}
-MAX_BODY = 512 * 1024 * 1024
 # shortcut: a generation longer than this is aborted. Raise it for huge batches.
 UPSTREAM_TIMEOUT = 6 * 60 * 60
 IMAGE_NAME = re.compile(r"[0-9a-f]{32}\.(png|jpg|webp|bin)")
@@ -63,22 +79,89 @@ secrets: deque[str] = deque(maxlen=32)
 secrets_lock = threading.Lock()
 
 
-class RelayServer4(ThreadingHTTPServer):
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    def __init__(
+        self,
+        server_address,
+        request_handler_class,
+        max_connections=DEFAULT_MAX_CONNECTIONS,
+        connection_slots=None,
+    ):
+        self.connection_slots = connection_slots or threading.BoundedSemaphore(max_connections)
+        super().__init__(server_address, request_handler_class)
+
+    def process_request(self, request, client_address):
+        if not self.connection_slots.acquire(blocking=False):
+            self._discard_headers(request)
+            try:
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Connection: close\r\n"
+                    b"Content-Length: 0\r\n"
+                    b"Retry-After: 1\r\n\r\n"
+                )
+            except OSError:
+                pass
+            self.close_request(request)
+            return
+        try:
+            thread = threading.Thread(
+                target=self.process_request_thread,
+                args=(request, client_address),
+                daemon=True,
+            )
+            thread.start()
+        except Exception:
+            self.connection_slots.release()
+            self.handle_error(request, client_address)
+            self.close_request(request)
+
+    @staticmethod
+    def _discard_headers(request):
+        request.settimeout(0.1)
+        data = bytearray()
+        while len(data) < 65536 and b"\r\n\r\n" not in data:
+            try:
+                chunk = request.recv(min(4096, 65536 - len(data)))
+            except (OSError, TimeoutError):
+                break
+            if not chunk:
+                break
+            data.extend(chunk)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.connection_slots.release()
+
+
+class RelayServer4(BoundedThreadingHTTPServer):
     address_family = socket.AF_INET
     allow_reuse_address = True
     daemon_threads = True
 
 
-class RelayServer6(ThreadingHTTPServer):
+class RelayServer6(BoundedThreadingHTTPServer):
     address_family = socket.AF_INET6
     allow_reuse_address = True
     daemon_threads = True
 
 
-def make_server(host: str, port: int) -> ThreadingHTTPServer:
+def make_server(
+    host: str,
+    port: int,
+    max_connections: int = DEFAULT_MAX_CONNECTIONS,
+    connection_slots=None,
+) -> ThreadingHTTPServer:
     server_cls = RelayServer6 if ip_address(host).version == 6 else RelayServer4
     try:
-        return server_cls((host, port), RelayHandler)
+        return server_cls(
+            (host, port),
+            RelayHandler,
+            max_connections=max_connections,
+            connection_slots=connection_slots,
+        )
     except OSError as e:
         raise SystemExit(f"failed to listen on {host}:{port}: {e}") from e
 
@@ -98,6 +181,45 @@ def parse_magicdns(name: str) -> str:
     if not MAGICDNS.fullmatch(cleaned):
         raise SystemExit(f"refusing image host {name!r}; expected this node's MagicDNS name")
     return cleaned
+
+
+def hostname_for_host(host: str) -> str:
+    try:
+        return str(ip_address(host)).lower()
+    except ValueError:
+        return host.lower().rstrip(".")
+
+
+def get_header(headers: list[tuple[str, str]], name: str) -> str | None:
+    return next((value for key, value in headers if key.lower() == name.lower()), None)
+
+
+def response_headers(
+    headers: list[tuple[str, str]], body_changed: bool = False
+) -> list[tuple[str, str]]:
+    connection_tokens = {
+        token.strip().lower()
+        for key, value in headers
+        if key.lower() == "connection"
+        for token in value.split(",")
+    }
+    excluded = (
+        HOP_BY_HOP_HEADERS
+        | connection_tokens
+        | {
+            "content-length",
+            "content-type",
+            "cache-control",
+            "date",
+            "server",
+            "x-content-type-options",
+        }
+    )
+    if body_changed:
+        excluded.update(
+            {"content-encoding", "content-md5", "digest", "etag", "content-range", "last-modified"}
+        )
+    return [(key, value) for key, value in headers if key.lower() not in excluded]
 
 
 def parse_tailscale_ip(text: str, network) -> str:
@@ -244,11 +366,20 @@ def load_config(path: Path) -> dict:
     image_dir = Path(str(data.get("image_dir", "images")))
     if not image_dir.is_absolute():
         image_dir = ROOT / image_dir
+    limits = {
+        "max_body_bytes": data.get("max_body_bytes", DEFAULT_MAX_BODY_BYTES),
+        "max_connections": data.get("max_connections", DEFAULT_MAX_CONNECTIONS),
+        "max_generations": data.get("max_generations", DEFAULT_MAX_GENERATIONS),
+    }
+    for key, value in limits.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{key} must be a positive integer")
     return {
         "forge_port": int(data.get("forge_port", 7860)),
         "listen_port": int(data.get("listen_port", 7861)),
         "image_dir": image_dir,
         "image_ttl_hours": float(data.get("image_ttl_hours", 168)),
+        **limits,
         "rules": parse_rules(data),
     }
 
@@ -443,6 +574,13 @@ class RelayHandler(BaseHTTPRequestHandler):
     base_url = ""
     config_path = CONFIG_PATH
     ttl_seconds = 168 * 3600
+    max_body_bytes = DEFAULT_MAX_BODY_BYTES
+    generation_slots = threading.BoundedSemaphore(DEFAULT_MAX_GENERATIONS)
+    upstream_timeout = UPSTREAM_TIMEOUT
+
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(REQUEST_TIMEOUT)
 
     def parse_request(self):
         raw = getattr(self, "raw_requestline", b"") or b""
@@ -456,85 +594,181 @@ class RelayHandler(BaseHTTPRequestHandler):
                 note = "ignored non-HTTP request"
             print(f"{self.log_date_time_string()} {note}", flush=True)
             return False
-        return super().parse_request()
+        if not super().parse_request():
+            return False
+        try:
+            target = urlsplit(self.path)
+        except ValueError:
+            target = None
+        if (
+            target is None
+            or target.scheme
+            or target.netloc
+            or not (target.path.startswith("/") or (self.command == "OPTIONS" and self.path == "*"))
+        ):
+            self._bad_request()
+            return False
+        if self.request_version == "HTTP/1.1" and not self._valid_host():
+            self._bad_request()
+            return False
+        return True
+
+    def _valid_host(self) -> bool:
+        values = self.headers.get_all("Host", [])
+        if len(values) != 1:
+            return False
+        try:
+            parsed = urlsplit("//" + values[0])
+            hostname = parsed.hostname
+            port = parsed.port if parsed.port is not None else 80
+        except ValueError:
+            return False
+        if (
+            not hostname
+            or parsed.username
+            or parsed.password
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+        ):
+            return False
+        if port != self.server.server_port:
+            return False
+        allowed = {hostname_for_host(self.connection.getsockname()[0])}
+        advertised = urlparse(self.base_url).hostname
+        if advertised:
+            allowed.add(advertised.lower().rstrip("."))
+        return hostname.lower().rstrip(".") in allowed
+
+    def _bad_request(self) -> None:
+        self.close_connection = True
+        self._send(400, b'{"error":"invalid request"}', "application/json")
 
     def log_message(self, format, *args):
-        # Request line only. Bodies can contain prompts.
-        text = format % args
-        if any(ord(ch) > 126 or (ord(ch) < 32 and ch != "\t") for ch in text):
-            text = "ignored non-HTTP request"
-        print(f"{self.log_date_time_string()} {text}", flush=True)
+        print(f"{self.log_date_time_string()} HTTP request handled", flush=True)
 
     def do_GET(self):
         path = urlparse(self.path).path
         if path.startswith("/images/"):
             self.serve_image(path)
             return
-        self.proxy()
+        self.proxy_if_allowed()
 
     def do_POST(self):
-        self.proxy()
+        self.proxy_if_allowed()
 
     do_PUT = do_POST
     do_DELETE = do_POST
     do_OPTIONS = do_POST
+
+    def proxy_if_allowed(self) -> None:
+        path = urlparse(self.path).path
+        if path == "/favicon.ico" and self.command == "GET":
+            self.proxy()
+        elif path.startswith(API_PREFIXES):
+            self.proxy()
+        else:
+            self._send(404, b"not found", "text/plain; charset=utf-8")
 
     def serve_image(self, path: str) -> None:
         name = unquote(path.removeprefix("/images/"))
         if not IMAGE_NAME.fullmatch(name):
             self._send(404, b"not found", "text/plain; charset=utf-8")
             return
-        file = self.image_dir / name
-        if not file.is_file():
+        try:
+            file = (self.image_dir / name).resolve(strict=True)
+            if file.parent != self.image_dir.resolve() or not file.is_file():
+                raise FileNotFoundError
+            size = file.stat().st_size
+        except OSError:
             self._send(404, b"not found", "text/plain; charset=utf-8")
             return
         kind = name.rsplit(".", 1)[1]
         content_type = {"png": "image/png", "jpg": "image/jpeg", "webp": "image/webp"}.get(
             kind, "application/octet-stream"
         )
-        self._send(200, file.read_bytes(), content_type)
+        self._send_headers(200, content_type, size)
+        try:
+            with file.open("rb") as image:
+                shutil.copyfileobj(image, self.wfile)
+        except OSError:
+            self.close_connection = True
 
     def proxy(self) -> None:
-        try:
-            length = int(self.headers.get("Content-Length", "0") or 0)
-        except ValueError:
-            self._send(400, b'{"error":"bad content-length"}', "application/json")
-            return
-        if length < 0 or length > MAX_BODY:
-            self._send(413, b'{"error":"body too large"}', "application/json")
-            return
-        body = self.rfile.read(length) if length else b""
         path = urlparse(self.path).path
-        # shortcut: extension generation routes are proxied as-is and can still return base64.
-        # Add the path to GEN_PATHS when it needs the same treatment.
         is_gen = self.command == "POST" and path in GEN_PATHS
-        if is_gen:
-            try:
-                payload = json.loads(body.decode("utf-8"))
-                rewritten = rewrite_payload(payload, load_rules(self.config_path))
-                body = json.dumps(rewritten, ensure_ascii=False).encode("utf-8")
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                self._send(400, b'{"error":"generation body must be JSON"}', "application/json")
-                return
-            except ValueError as e:
-                message = json.dumps({"error": str(e)}).encode("utf-8")
-                self._send(400, message, "application/json")
-                return
-        status, raw, content_type = self.forward(body)
-        if status == 0:
+        if is_gen and not self.generation_slots.acquire(blocking=False):
+            self.close_connection = True
+            self._send(503, b'{"error":"generation capacity reached"}', "application/json")
             return
-        if is_gen and status == 200:
-            try:
-                raw = generation_result(raw, self.base_url, self.image_dir, self.ttl_seconds)
-                content_type = "application/json"
-            except ValueError as e:
-                message = json.dumps({"error": str(e)}).encode("utf-8")
-                self._send(502, message, "application/json")
+        try:
+            if self.headers.get("Transfer-Encoding") is not None:
+                self.close_connection = True
+                self._send(400, b'{"error":"unsupported transfer-encoding"}', "application/json")
                 return
-        raw = maybe_redact(raw)
-        self._send(status, raw, content_type)
+            lengths = self.headers.get_all("Content-Length", [])
+            raw_length = lengths[0].strip() if lengths else "0"
+            if len(lengths) > 1 or not re.fullmatch(r"[0-9]+", raw_length):
+                self.close_connection = True
+                self._send(400, b'{"error":"bad content-length"}', "application/json")
+                return
+            normalized_length = raw_length.lstrip("0") or "0"
+            max_length = str(self.max_body_bytes)
+            if len(normalized_length) > len(max_length) or (
+                len(normalized_length) == len(max_length) and normalized_length > max_length
+            ):
+                self.close_connection = True
+                self._send(413, b'{"error":"body too large"}', "application/json")
+                return
+            length = int(normalized_length)
+            try:
+                body = self.rfile.read(length) if length else b""
+            except (OSError, TimeoutError):
+                self.close_connection = True
+                self._send(408, b'{"error":"request body timeout"}', "application/json")
+                return
+            if len(body) != length:
+                self.close_connection = True
+                self._send(400, b'{"error":"incomplete request body"}', "application/json")
+                return
+            if is_gen:
+                try:
+                    payload = json.loads(body.decode("utf-8"))
+                    rewritten = rewrite_payload(payload, load_rules(self.config_path))
+                    body = json.dumps(rewritten, ensure_ascii=False).encode("utf-8")
+                    if len(body) > self.max_body_bytes:
+                        self._send(413, b'{"error":"body too large"}', "application/json")
+                        return
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    self._send(400, b'{"error":"generation body must be JSON"}', "application/json")
+                    return
+                except ValueError as e:
+                    message = json.dumps({"error": str(e)}).encode("utf-8")
+                    self._send(400, message, "application/json")
+                    return
+            status, raw, headers = self.forward(body)
+            if status == 0:
+                return
+            content_type = get_header(headers, "Content-Type") or "application/octet-stream"
+            body_changed = False
+            if is_gen and status == 200:
+                try:
+                    raw = generation_result(raw, self.base_url, self.image_dir, self.ttl_seconds)
+                    content_type = "application/json"
+                    body_changed = True
+                except ValueError as e:
+                    message = json.dumps({"error": str(e)}).encode("utf-8")
+                    self._send(502, message, "application/json")
+                    return
+            original_raw = raw
+            raw = maybe_redact(raw)
+            body_changed = body_changed or raw != original_raw
+            self._send(status, raw, content_type, response_headers(headers, body_changed))
+        finally:
+            if is_gen:
+                self.generation_slots.release()
 
-    def forward(self, body: bytes) -> tuple[int, bytes, str]:
+    def forward(self, body: bytes) -> tuple[int, bytes, list[tuple[str, str]]]:
         request = Request(self.upstream + self.path, data=body or None, method=self.command)
         for key, value in self.headers.items():
             if key.lower() not in DROP_REQUEST_HEADERS:
@@ -543,28 +777,46 @@ class RelayHandler(BaseHTTPRequestHandler):
             request.add_header("Content-Type", self.headers.get("Content-Type", "application/json"))
             request.add_header("Content-Length", str(len(body)))
         try:
-            with urlopen(request, timeout=UPSTREAM_TIMEOUT) as response:
-                content_type = response.headers.get("Content-Type", "application/octet-stream")
-                return response.status, response.read(), content_type
+            with urlopen(request, timeout=self.upstream_timeout) as response:
+                return response.status, response.read(), list(response.headers.items())
         except HTTPError as e:
-            content_type = (
-                e.headers.get("Content-Type", "application/octet-stream")
-                if e.headers
-                else "application/octet-stream"
-            )
-            return e.code, e.read(), content_type
-        except URLError:
-            self._send(502, b'{"error":"upstream unreachable"}', "application/json")
-            return 0, b"", ""
+            try:
+                return e.code, e.read(), list(e.headers.items()) if e.headers else []
+            except TimeoutError:
+                self._send(504, b'{"error":"upstream timeout"}', "application/json")
+                return 0, b"", []
+        except TimeoutError:
+            self._send(504, b'{"error":"upstream timeout"}', "application/json")
+            return 0, b"", []
+        except URLError as e:
+            if isinstance(e.reason, (TimeoutError, socket.timeout)):
+                self._send(504, b'{"error":"upstream timeout"}', "application/json")
+            else:
+                self._send(502, b'{"error":"upstream unreachable"}', "application/json")
+            return 0, b"", []
+        except (OSError, http.client.HTTPException):
+            self._send(502, b'{"error":"invalid upstream response"}', "application/json")
+            return 0, b"", []
 
-    def _send(self, status: int, body: bytes, content_type: str) -> None:
+    def _send(self, status: int, body: bytes, content_type: str, headers=()) -> None:
+        if 100 <= status < 200 or status in {204, 205, 304}:
+            body = b""
+        self._send_headers(status, content_type, len(body), headers)
+        try:
+            self.wfile.write(body)
+        except OSError:
+            self.close_connection = True
+
+    def _send_headers(self, status: int, content_type: str, length: int, headers=()) -> None:
         self.send_response(status)
+        for key, value in headers:
+            self.send_header(key, value)
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
+        if not (100 <= status < 200 or status in {204, 304}):
+            self.send_header("Content-Length", str(length))
         self.send_header("Cache-Control", "private, no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
-        self.wfile.write(body)
 
 
 def listen_hosts(ip4: str, ip6: str | None) -> list[str]:
@@ -587,13 +839,23 @@ def main() -> None:
     RelayHandler.base_url = base_url
     RelayHandler.config_path = CONFIG_PATH
     RelayHandler.ttl_seconds = settings["image_ttl_hours"] * 3600
+    RelayHandler.max_body_bytes = settings["max_body_bytes"]
+    RelayHandler.generation_slots = threading.BoundedSemaphore(settings["max_generations"])
     hosts = listen_hosts(ip4, ip6)
     for host in hosts:
         assert_this_machine(host, own, "listen")
     servers = []
+    connection_slots = threading.BoundedSemaphore(settings["max_connections"])
     try:
         for host in hosts:
-            servers.append(make_server(host, port))
+            servers.append(
+                make_server(
+                    host,
+                    port,
+                    settings["max_connections"],
+                    connection_slots,
+                )
+            )
     except SystemExit:
         for server in servers:
             server.server_close()
