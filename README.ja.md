@@ -18,9 +18,62 @@ Forge Neo API の前段に置くリレーです。Forge Neo にはリレー実�
 uv run python relay.py
 ```
 
-起動ログの `tailscale` 行が、エージェントに渡すベース URL です。画像 URL にも同じホスト名（MagicDNS の `*.ts.net`）を使います。MagicDNS が取れないときだけ Tailscale IPv4 を使います。
+起動ログの `tailscale` 行がエージェントに渡すベース URL です。画像 URL にも同じホスト名（MagicDNS の `*.ts.net`）を使います。MagicDNS が取れないときだけ Tailscale IPv4 を使います。
 
 Forge への転送先は常に `http://127.0.0.1:<forge_port>` です。`forge_port` は `config.json` で設定します。転送先をTailscaleアドレスに変更する設定はありません。
+
+## リレー仕様
+
+リレーのプロトコルは HTTP/1.1 です。`Upgrade` ヘッダーは Forge へ転送しないので、WebSocket への切り替えは Forge に届きません。
+
+### 生成
+
+生成は `POST /sdapi/v1/txt2img` と `POST /sdapi/v1/img2img` だけです。ボディは JSON オブジェクトです。
+
+`prompt` には `positive` のルールを、`negative_prompt` には `negative` のルールを適用します。空でない `hr_prompt` と `hr_negative_prompt` にも同じ側のルールを適用します。この2つの欄が空文字のときは空のままにし、ボディに無いときも欄は足しません。Hires. fix が有効なとき、Forge は空の Hires 用プロンプトへ本体のプロンプトをコピーします。ルールの書き方は「プロンプトルール」にあります。ルールが1つでもある側で、`prompt` または `negative_prompt` が無いときは、空文字にルールを適用してその欄を足します。`prompt` と `negative_prompt` の `null` は空文字として扱います。
+
+プロンプト欄は文字列です。文字列の配列なら、各文字列にルールを適用します。それ以外の型は受け付けません。
+
+プロンプト欄以外は受け取ったまま Forge へ渡します。転送の前に、リレーは `send_images` を `true` にします。
+
+生成が成功したときのボディは `images`、`seeds`、`subseeds` だけです。`info` も `parameters` もプロンプト文も入れません。
+
+```json
+{
+  "images": ["http://<ホスト>:<listen_port>/images/<小文字16進32桁>.png"],
+  "seeds": [1234567890],
+  "subseeds": [0]
+}
+```
+
+`images`、`seeds`、`subseeds` の同じ添字が1枚の枠です。Forge がその枠に空文字、または文字列以外を返したとき、その `images` は `null` です。`seeds` と `subseeds` には Forge の `info` にある `all_seeds` と `all_subseeds` の JSON の整数だけを、`index_of_first_image` の位置から置きます。その位置より前の枠は `null` です。Forge が先頭のグリッド画像のためにこの値を置くと、その枠のシードは `null` になります。`return_mask` がシードの間に画像を入れる並びでは、枠は揃いません。
+
+画像のバイト列はリレーが保存し、URL だけを返します。URL のホストは起動ログの `tailscale` 行と同じです。エージェントにはこの URL を復号せず、取得せず、ファイルへ保存せず、文字列のまま渡すよう伝えてください。保存したファイルは Forge が返したバイト列そのものです。PNG などの parameters メタデータには、書き換えたプロンプトが残ることがあります。
+
+ファイル名は小文字の16進32桁に `.png`、`.jpg`、`.webp`、`.bin` のいずれかを付けたものです。`GET /images/<名前>` が返す Content-Type は `image/png`、`image/jpeg`、`image/webp`、`application/octet-stream` です。名前がこの形でないときと、ファイルが無いときは、404 と `not found` を返します。`image_ttl_hours` を過ぎたファイルは次の生成のときに削除します。値が `0` のときは削除しません。
+
+### 生成以外
+
+リレーが受け付けるメソッドは `GET`、`POST`、`PUT`、`DELETE`、`OPTIONS` です。`GET /images/...` と上の2つの生成を除き、Forge のステータスとボディをそのまま返します。クエリ文字列は転送し、生成かどうかはクエリ文字列を除いたパスで判定します。拡張機能の生成ルートもこの扱いで、応答に base64 の画像が残ることがあります。
+
+`current_image`、`image`、`images`、`init_images`、`mask` の中身は消しません。進行状況の `current_image` には、途中の画像が base64 で残ることがあります。書き換えたプロンプトがエージェントの送った文と違うとき、リレーはその文字列を32件まで覚え、あとの応答の文字列から除きます。画像の欄と、保存したファイルからは除きません。別の文字列にその文が含まれていれば、その部分も除きます。
+
+### エラーと制限
+
+- 生成のボディが JSON として読めない: 400 `{"error":"generation body must be JSON"}`
+- JSON だがオブジェクトでない: 400 `{"error":"generation body must be a JSON object"}`
+- プロンプト欄が文字列でも文字列の配列でもない: 400 `{"error":"prompt fields must be strings"}`
+- `config.json` が読めない、またはルールとして無効: 400 `{"error":"prompt rules file is invalid"}`。詳しい理由はサーバーのログに出します。
+- `Content-Length` が整数でない: 400 `{"error":"bad content-length"}`
+- `Content-Length` が無い: ボディは空として扱います
+- `Content-Length` が 0 未満、または 512 MiB を超える: 413 `{"error":"body too large"}`
+- Forge へ接続できない、または生成が 6時間で終わらない: 502 `{"error":"upstream unreachable"}`
+- 生成の 200 応答を URL とシードにできない: 502。画像の並びを読めないときの `error` は `upstream generation response was not JSON`、`upstream images field is not a list`、`upstream image was not decodable` です。`index_of_first_image` を整数として読めないときも 502 で、変換に失敗したメッセージが `error` になります。
+- 生成のステータスが 200 以外: Forge のステータスとボディを返します
+
+応答には `Cache-Control: private, no-store` と `X-Content-Type-Options: nosniff` を付けます。
+
+この HTTP ポートに TLS の開始バイトが来たときは、接続を切り、ログに `ignored TLS handshake on the HTTP port` と出します。それ以外の HTTP でない要求は、ログに `ignored non-HTTP request` と出します。受け取ったバイト列はログに書きません。
 
 ## 設定ファイル
 

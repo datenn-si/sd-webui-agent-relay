@@ -22,6 +22,59 @@ The `tailscale` line in the startup log is the base URL to give to the agent. Im
 
 The forwarding destination to Forge is always `http://127.0.0.1:<forge_port>`. Set `forge_port` in `config.json`. There is no setting to change the forwarding destination to a Tailscale address.
 
+## Relay specification
+
+The relay speaks HTTP/1.1. It drops the `Upgrade` header, so a switch to WebSocket does not reach Forge.
+
+### Generation
+
+Generation is only `POST /sdapi/v1/txt2img` and `POST /sdapi/v1/img2img`. The body is a JSON object.
+
+The relay applies the `positive` rules to `prompt` and the `negative` rules to `negative_prompt`. It applies the same side to `hr_prompt` and `hr_negative_prompt` when those values are not empty. An empty string in either Hires field stays empty, and a missing Hires field is not added. Forge copies the main prompt into an empty Hires prompt when Hires. fix is on. Prompt Rules describes how a rule is written. If a side has at least one rule and `prompt` or `negative_prompt` is missing, the relay applies the rules to an empty string and adds the field. `null` in `prompt` or `negative_prompt` is treated as an empty string.
+
+A prompt field is a string. Each string in a list of strings is rewritten. Any other type is rejected.
+
+Every other field is forwarded as received. Before forwarding, the relay sets `send_images` to `true`.
+
+A successful generation body contains only `images`, `seeds`, and `subseeds`. It does not contain `info`, `parameters`, or prompt text.
+
+```json
+{
+  "images": ["http://<host>:<listen_port>/images/<32 lowercase hex digits>.png"],
+  "seeds": [1234567890],
+  "subseeds": [0]
+}
+```
+
+The same index in `images`, `seeds`, and `subseeds` is one slot. When Forge returns an empty string or a non-string for a slot, that `images` entry is `null`. `seeds` and `subseeds` receive only the JSON integers from `all_seeds` and `all_subseeds` in Forge's `info`, starting at `index_of_first_image`. Slots before that index are `null`. When Forge sets the index for a leading grid image, that slot's seed is `null`. Slots do not line up when `return_mask` inserts images between seeds.
+
+The relay stores the image bytes and returns a URL. The URL host is the `tailscale` line in the startup log. Tell the agent to pass that URL string on as it is. The agent must not decode it, request it, or save it to a file. The stored file is the byte string Forge returned, so parameters metadata in a PNG can still contain the rewritten prompt.
+
+A file name is 32 lowercase hex digits plus `.png`, `.jpg`, `.webp`, or `.bin`. The `Content-Type` from `GET /images/<name>` is `image/png`, `image/jpeg`, `image/webp`, or `application/octet-stream`. A name in any other shape, and a missing file, return 404 and `not found`. Files older than `image_ttl_hours` are deleted on the next generation. `0` keeps the files.
+
+### Other routes
+
+The relay accepts `GET`, `POST`, `PUT`, `DELETE`, and `OPTIONS`. Aside from `GET /images/...` and the two generation posts, it returns Forge's status and body unchanged. The query string is forwarded, and whether a request is generation is decided from the path with the query string removed. Extension generation routes take this path, and the response can still contain base64 image data.
+
+The relay does not remove the contents of `current_image`, `image`, `images`, `init_images`, or `mask`. A progress response can still carry a preview in `current_image` as base64. When a rewritten prompt differs from the text the agent sent, the relay remembers up to 32 of those strings and removes them from the text of later responses. It does not remove them from image fields or from stored files. A string that contains one of them loses that part as well.
+
+### Errors and limits
+
+- The generation body is not valid JSON: 400 `{"error":"generation body must be JSON"}`.
+- The JSON value is not an object: 400 `{"error":"generation body must be a JSON object"}`.
+- A prompt field is neither a string nor a list of strings: 400 `{"error":"prompt fields must be strings"}`.
+- `config.json` cannot be read, or the rules are invalid: 400 `{"error":"prompt rules file is invalid"}`. The server log has the detail.
+- `Content-Length` is not an integer: 400 `{"error":"bad content-length"}`.
+- `Content-Length` is absent: the body is empty.
+- `Content-Length` is below 0, or above 512 MiB: 413 `{"error":"body too large"}`.
+- Forge cannot be reached, or a generation does not finish within 6 hours: 502 `{"error":"upstream unreachable"}`.
+- A generation response of 200 cannot be turned into URLs and seeds: 502. When the image list cannot be read, `error` is `upstream generation response was not JSON`, `upstream images field is not a list`, or `upstream image was not decodable`. When `index_of_first_image` cannot be read as an integer, the 502 `error` is that conversion message.
+- Generation status is not 200: Forge's status and body are returned.
+
+Responses include `Cache-Control: private, no-store` and `X-Content-Type-Options: nosniff`.
+
+A TLS client hello on this HTTP port closes the connection. The log line is `ignored TLS handshake on the HTTP port`. Any other non-HTTP request logs `ignored non-HTTP request`. The received bytes are not written to the log.
+
 ## Configuration File
 
 Create your local configuration from the sample.
