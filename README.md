@@ -44,7 +44,7 @@ A successful generation body contains only `images`, `seeds`, and `subseeds`. It
 
 ```json
 {
-  "images": ["http://<host>:<listen_port>/images/<32 lowercase hex digits>.png"],
+  "images": ["http://<host>:<listen_port>/images/20261107_000001_123456.png"],
   "seeds": [1234567890],
   "subseeds": [0]
 }
@@ -54,7 +54,7 @@ The same index in `images`, `seeds`, and `subseeds` is one slot. When Forge retu
 
 The relay stores the image bytes and returns a URL. The URL host is the `tailscale` line in the startup log. Tell the agent to pass that URL string on as it is. The agent must not decode it, request it, or save it to a file. The stored file is the byte string Forge returned, so parameters metadata in a PNG can still contain the rewritten prompt.
 
-A file name is 32 lowercase hex digits plus `.png`, `.jpg`, `.webp`, or `.bin`. The `Content-Type` from `GET /images/<name>` is `image/png`, `image/jpeg`, `image/webp`, or `application/octet-stream`. A name in any other shape, and a missing file, return 404 and `not found`. Files older than `image_ttl_hours` are deleted on the next generation. `0` keeps the files.
+New file names use `YYYYMMDD_<sequence>_<seed>.<extension>`, for example `20261107_000001_123456.png`. The sequence is at least six digits and increments per saved image each day; `none` is used when Forge provides no seed for that image slot. Existing UUID-named files remain accessible. The `Content-Type` from `GET /images/<name>` is `image/png`, `image/jpeg`, `image/webp`, or `application/octet-stream`. A name in any other shape, and a missing file, return 404 and `not found`. Files older than `image_ttl_hours` are deleted on the next generation. `0` keeps the files.
 
 ### Other routes
 
@@ -77,9 +77,9 @@ The relay does not remove the contents of `current_image`, `image`, `images`, `i
 - A generation response of 200 cannot be turned into URLs and seeds: 502. When the image list cannot be read, `error` is `upstream generation response was not JSON`, `upstream images field is not a list`, or `upstream image was not decodable`. When `index_of_first_image` cannot be read as an integer, the 502 `error` is that conversion message.
 - Generation status is not 200: Forge's status and body are returned.
 
-Forge error responses preserve their status, body, and applicable end-to-end headers. Responses include `Cache-Control: private, no-store` and `X-Content-Type-Options: nosniff`. HTTP request targets and bodies are not written to the log.
+Forge error responses preserve their status, body, and applicable end-to-end headers. Responses include `Cache-Control: private, no-store` and `X-Content-Type-Options: nosniff`. HTTP logs include the client IP, method, path without its query string, and response status. Query strings and request bodies are not logged.
 
-A TLS client hello on this HTTP port closes the connection. The log line is `ignored TLS handshake on the HTTP port`. Any other non-HTTP request logs `ignored non-HTTP request`. Normal HTTP requests are logged without their request target. Received non-HTTP bytes and request bodies are not written to the log.
+A TLS client hello on this HTTP port closes the connection. The log line is `ignored TLS handshake on the HTTP port`. Any other non-HTTP request logs `ignored non-HTTP request`. Received non-HTTP bytes and request bodies are not written to the log.
 
 ## Configuration File
 

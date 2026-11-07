@@ -17,11 +17,11 @@ import socket
 import subprocess
 import threading
 import time
-import uuid
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ipaddress import ip_address, ip_network
 from pathlib import Path
+from typing import cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlparse, urlsplit
 from urllib.request import Request, urlopen
@@ -70,13 +70,18 @@ REQUEST_TIMEOUT = 30
 IMAGE_KEYS = {"current_image", "image", "images", "init_images", "mask"}
 # shortcut: a generation longer than this is aborted. Raise it for huge batches.
 UPSTREAM_TIMEOUT = 6 * 60 * 60
-IMAGE_NAME = re.compile(r"[0-9a-f]{32}\.(png|jpg|webp|bin)")
+IMAGE_NAME = re.compile(
+    r"(?:[0-9a-f]{32}|(?P<date>[0-9]{8})_(?P<sequence>[0-9]{6,})_"
+    r"(?P<seed>none|-?[0-9]+))\.(?P<extension>png|jpg|webp|bin)"
+)
 MAGICDNS = re.compile(r"[a-z0-9-]+(?:\.[a-z0-9-]+)*\.ts\.net")
 
 # Rewritten prompts that differ from the agent's text. Scrubbed from JSON
 # echoes. Not removed from saved image metadata.
 secrets: deque[str] = deque(maxlen=32)
 secrets_lock = threading.Lock()
+image_sequence_lock = threading.Lock()
+image_sequences: dict[tuple[Path, str], int] = {}
 
 
 class BoundedThreadingHTTPServer(ThreadingHTTPServer):
@@ -91,10 +96,11 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
         super().__init__(server_address, request_handler_class)
 
     def process_request(self, request, client_address):
+        request_socket = cast(socket.socket, request)
         if not self.connection_slots.acquire(blocking=False):
-            self._discard_headers(request)
+            self._discard_headers(request_socket)
             try:
-                request.sendall(
+                request_socket.sendall(
                     b"HTTP/1.1 503 Service Unavailable\r\n"
                     b"Connection: close\r\n"
                     b"Content-Length: 0\r\n"
@@ -102,19 +108,19 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
                 )
             except OSError:
                 pass
-            self.close_request(request)
+            self.close_request(request_socket)
             return
         try:
             thread = threading.Thread(
                 target=self.process_request_thread,
-                args=(request, client_address),
+                args=(request_socket, client_address),
                 daemon=True,
             )
             thread.start()
         except Exception:
             self.connection_slots.release()
-            self.handle_error(request, client_address)
-            self.close_request(request)
+            self.handle_error(request_socket, client_address)
+            self.close_request(request_socket)
 
     @staticmethod
     def _discard_headers(request):
@@ -469,6 +475,23 @@ def align_seeds(count: int, info: dict, key: str) -> list:
     return aligned
 
 
+def next_image_name(image_dir: Path, seed: int | None, extension: str) -> str:
+    date = time.strftime("%Y%m%d")
+    key = (image_dir.resolve(), date)
+    with image_sequence_lock:
+        sequence = image_sequences.get(key)
+        if sequence is None:
+            sequence = 0
+            for path in image_dir.iterdir():
+                match = IMAGE_NAME.fullmatch(path.name)
+                if match and match.group("date") == date:
+                    sequence = max(sequence, int(match.group("sequence")))
+        sequence += 1
+        image_sequences[key] = sequence
+    seed_name = str(seed) if isinstance(seed, int) and not isinstance(seed, bool) else "none"
+    return f"{date}_{sequence:06d}_{seed_name}.{extension}"
+
+
 def generation_result(
     upstream_body: bytes, base_url: str, image_dir: Path, ttl_seconds: float
 ) -> bytes:
@@ -487,10 +510,12 @@ def generation_result(
             info = {}
     if not isinstance(info, dict):
         info = {}
+    seeds = align_seeds(len(images), info, "all_seeds")
+    subseeds = align_seeds(len(images), info, "all_subseeds")
     sweep(image_dir, ttl_seconds)
     image_dir.mkdir(parents=True, exist_ok=True)
     urls = []
-    for item in images:
+    for index, item in enumerate(images):
         if not isinstance(item, str) or item == "":
             urls.append(None)
             continue
@@ -499,13 +524,13 @@ def generation_result(
             raw = base64.b64decode(blob, validate=False)
         except binascii.Error as e:
             raise ValueError("upstream image was not decodable") from e
-        name = uuid.uuid4().hex + "." + sniff_ext(raw)
+        name = next_image_name(image_dir, seeds[index], sniff_ext(raw))
         (image_dir / name).write_bytes(raw)
         urls.append(f"{base_url}/images/{name}")
     result = {
         "images": urls,
-        "seeds": align_seeds(len(urls), info, "all_seeds"),
-        "subseeds": align_seeds(len(urls), info, "all_subseeds"),
+        "seeds": seeds,
+        "subseeds": subseeds,
     }
     return json.dumps(result).encode("utf-8")
 
@@ -632,7 +657,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             or parsed.fragment
         ):
             return False
-        if port != self.server.server_port:
+        if port != cast(ThreadingHTTPServer, self.server).server_port:
             return False
         allowed = {hostname_for_host(self.connection.getsockname()[0])}
         advertised = urlparse(self.base_url).hostname
@@ -644,8 +669,19 @@ class RelayHandler(BaseHTTPRequestHandler):
         self.close_connection = True
         self._send(400, b'{"error":"invalid request"}', "application/json")
 
+    def log_request(self, code="-", size="-"):
+        try:
+            path = urlsplit(self.path).path
+        except ValueError:
+            path = "-"
+        client_ip = self.client_address[0]
+        print(
+            f"{self.log_date_time_string()} {client_ip} {self.command or '-'} {code} {path}",
+            flush=True,
+        )
+
     def log_message(self, format, *args):
-        print(f"{self.log_date_time_string()} HTTP request handled", flush=True)
+        print(f"{self.log_date_time_string()} HTTP protocol error", flush=True)
 
     def do_GET(self):
         path = urlparse(self.path).path
@@ -707,7 +743,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                 self._send(400, b'{"error":"unsupported transfer-encoding"}', "application/json")
                 return
             lengths = self.headers.get_all("Content-Length", [])
-            raw_length = lengths[0].strip() if lengths else "0"
+            raw_length = cast(str, lengths[0]).strip() if lengths else "0"
             if len(lengths) > 1 or not re.fullmatch(r"[0-9]+", raw_length):
                 self.close_connection = True
                 self._send(400, b'{"error":"bad content-length"}', "application/json")

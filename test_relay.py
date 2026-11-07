@@ -6,6 +6,7 @@ import json
 import socket
 import struct
 import threading
+import time
 import unittest
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -121,6 +122,20 @@ class ConfigTests(unittest.TestCase):
             path.write_text('{"max_connections": 0}', encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "max_connections"):
                 relay.load_config(path)
+
+
+class ImageNameTests(unittest.TestCase):
+    def test_sequence_resumes_after_existing_files(self):
+        with TemporaryDirectory() as directory:
+            image_dir = Path(directory) / "images"
+            image_dir.mkdir()
+            date = time.strftime("%Y%m%d")
+            (image_dir / f"{date}_000007_1.png").touch()
+            self.assertEqual(relay.next_image_name(image_dir, 42, "png"), f"{date}_000008_42.png")
+            self.assertEqual(
+                relay.next_image_name(image_dir, None, "png"), f"{date}_000009_none.png"
+            )
+            self.assertTrue(relay.IMAGE_NAME.fullmatch("a" * 32 + ".png"))
 
 
 class FakeForge(BaseHTTPRequestHandler):
@@ -274,6 +289,12 @@ class RelayHttpTests(unittest.TestCase):
         self.assertEqual(body["seeds"], [None, 42, 43])
         self.assertEqual(body["subseeds"], [None, 7, 8])
         self.assertTrue(body["images"][1].startswith(f"http://{TEST_MAGICDNS}:7861/images/"))
+        names = [url.rsplit("/", 1)[1] for url in body["images"]]
+        matches = [relay.IMAGE_NAME.fullmatch(name) for name in names]
+        self.assertTrue(all(matches))
+        self.assertEqual([match.group("seed") for match in matches], ["none", "42", "43"])
+        sequences = [int(match.group("sequence")) for match in matches]
+        self.assertEqual(sequences, list(range(sequences[0], sequences[0] + len(sequences))))
         self.assertEqual(FakeForge.last["prompt"], "cat, SECRET_ADDED_TAG")
         self.assertEqual(FakeForge.last["negative_prompt"], "SECRET_NEG, ugly")
         self.assertEqual(FakeForge.last["steps"], 4)
@@ -299,6 +320,18 @@ class RelayHttpTests(unittest.TestCase):
         self.assertIn("ignored non-HTTP request", log)
         self.assertNotIn("Bad request version", log)
         self.assertTrue(all(ord(ch) < 127 or ch in "\n\r" for ch in log))
+
+    def test_http_log_includes_route_diagnostics_but_not_query_or_body(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with urlopen(
+                f"http://127.0.0.1:{self.relay_port}/api/headers?token=hidden-value", timeout=5
+            ) as response:
+                response.read()
+        log = buf.getvalue()
+        self.assertIn("127.0.0.1 GET 202 /api/headers", log)
+        self.assertNotIn("hidden-value", log)
+        self.assertNotIn("upstream", log)
 
     def test_other_routes_pass_through(self):
         with urlopen(

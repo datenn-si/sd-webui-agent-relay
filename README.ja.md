@@ -44,7 +44,7 @@ Forge への転送先は常に `http://127.0.0.1:<forge_port>` です。`forge_p
 
 ```json
 {
-  "images": ["http://<ホスト>:<listen_port>/images/<小文字16進32桁>.png"],
+  "images": ["http://<ホスト>:<listen_port>/images/20261107_000001_123456.png"],
   "seeds": [1234567890],
   "subseeds": [0]
 }
@@ -54,7 +54,7 @@ Forge への転送先は常に `http://127.0.0.1:<forge_port>` です。`forge_p
 
 画像のバイト列はリレーが保存し、URL だけを返します。URL のホストは起動ログの `tailscale` 行と同じです。エージェントにはこの URL を復号せず、取得せず、ファイルへ保存せず、文字列のまま渡すよう伝えてください。保存したファイルは Forge が返したバイト列そのものです。PNG などの parameters メタデータには、書き換えたプロンプトが残ることがあります。
 
-ファイル名は小文字の16進32桁に `.png`、`.jpg`、`.webp`、`.bin` のいずれかを付けたものです。`GET /images/<名前>` が返す Content-Type は `image/png`、`image/jpeg`、`image/webp`、`application/octet-stream` です。名前がこの形でないときと、ファイルが無いときは、404 と `not found` を返します。`image_ttl_hours` を過ぎたファイルは次の生成のときに削除します。値が `0` のときは削除しません。
+新しいファイル名は `YYYYMMDD_<連番>_<シード>.<拡張子>` 形式です（例: `20261107_000001_123456.png`）。連番は画像ごとに日付単位で増加し、最低6桁です。Forgeからその画像スロットのシードが得られない場合は `none` を使います。既存のUUID形式のファイル名も引き続き配信できます。`GET /images/<名前>` が返す Content-Type は `image/png`、`image/jpeg`、`image/webp`、`application/octet-stream` です。名前がこの形でないときと、ファイルが無いときは、404 と `not found` を返します。`image_ttl_hours` を過ぎたファイルは次の生成のときに削除します。値が `0` のときは削除しません。
 
 ### 生成以外
 
@@ -77,7 +77,7 @@ Forge へ転送するのは `/sdapi/`、`/api/`、`/internal/` 配下のAPIパ�
 - 生成の 200 応答を URL とシードにできない: 502。画像の並びを読めないときの `error` は `upstream generation response was not JSON`、`upstream images field is not a list`、`upstream image was not decodable` です。`index_of_first_image` を整数として読めないときも 502 で、変換に失敗したメッセージが `error` になります。
 - 生成のステータスが 200 以外: Forge のステータスとボディを返します
 
-ForgeのHTTPエラー応答は、可能な範囲でステータス、ボディ、エンドツーエンドのヘッダーを維持します。応答には `Cache-Control: private, no-store` と `X-Content-Type-Options: nosniff` を付けます。通常のHTTPリクエストは、リクエストターゲットを含めてログに出しません。
+ForgeのHTTPエラー応答は、可能な範囲でステータス、ボディ、エンドツーエンドのヘッダーを維持します。応答には `Cache-Control: private, no-store` と `X-Content-Type-Options: nosniff` を付けます。HTTPログには接続元IP、メソッド、クエリ文字列を除いたパス、応答ステータスを記録します。クエリ文字列とリクエストボディは記録しません。
 
 この HTTP ポートに TLS の開始バイトが来たときは、接続を切り、ログに `ignored TLS handshake on the HTTP port` と出します。それ以外の HTTP でない要求は、ログに `ignored non-HTTP request` と出します。受け取ったバイト列とリクエストボディはログに書きません。
 
